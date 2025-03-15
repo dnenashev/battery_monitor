@@ -248,13 +248,14 @@ def get_app_energy_usage():
     """
     Get energy usage per application using powermetrics.
     Returns a dictionary with app names and their current power usage in watts,
-    energy impact score, and 12-hour consumption estimate.
+    energy impact score, energy_impact_per_s, and 12-hour consumption estimate.
     """
     try:
         # Initialize default structure
         app_energy = defaultdict(lambda: {
             'power_watts': 0.0,
             'energy_impact_score': 0,
+            'energy_impact_per_s': 0.0,
             'consumption_12h': 0.0
         })
         process_to_app_map = {}
@@ -264,6 +265,7 @@ def get_app_energy_usage():
         return defaultdict(lambda: {
             'power_watts': 0.0,
             'energy_impact_score': 0,
+            'energy_impact_per_s': 0.0,
             'consumption_12h': 0.0
         })
     
@@ -272,17 +274,18 @@ def get_app_energy_usage():
         powermetrics_data = {}
         
         try:
-            # Run powermetrics with a short sampling period
-            powermetrics_cmd = ['powermetrics', '-n', '1', '-i', '1000', '--show-process-energy', '--format', 'json']
+            # Run powermetrics with a short sampling period using plist format (exactly like in parsemetrics.py)
+            powermetrics_cmd = ['powermetrics', '-n', '1', '-i', '1000', '--show-process-energy', '--format', 'plist']
             
             # Check if we have permission to run powermetrics
             try:
-                powermetrics_result = subprocess.run(powermetrics_cmd, capture_output=True, text=True, timeout=3)
+                powermetrics_result = subprocess.run(powermetrics_cmd, capture_output=True, text=False, timeout=3)
             except PermissionError:
                 print("Error: Insufficient permissions for powermetrics. Please run with sudo.")
                 return defaultdict(lambda: {
                     'power_watts': 0.0,
                     'energy_impact_score': 0,
+                    'energy_impact_per_s': 0.0,
                     'consumption_12h': 0.0
                 })
             
@@ -291,34 +294,21 @@ def get_app_energy_usage():
                 return defaultdict(lambda: {
                     'power_watts': 0.0,
                     'energy_impact_score': 0,
+                    'energy_impact_per_s': 0.0,
                     'consumption_12h': 0.0
                 })
                 
             try:
-                # Print first 500 characters of raw output for debugging
-                print("\nDEBUG - Raw powermetrics output (first 500 chars):")
-                print(powermetrics_result.stdout[:500])
-                print("...")
+                # Import plistlib for parsing plist format
+                import plistlib
                 
                 try:
-                    # Since powermetrics is outputting text format instead of JSON despite the --format json flag,
-                    # we'll parse the text output directly
-                    stdout_content = powermetrics_result.stdout.strip()
+                    # Parse the plist data from powermetrics output (exactly like in parsemetrics.py)
+                    power_data = plistlib.loads(powermetrics_result.stdout)
+                    print("Successfully parsed plist data from powermetrics")
                     
-                    # Check if we can find any JSON data in the output
-                    json_start = stdout_content.find('{')
-                    if json_start >= 0:
-                        print(f"Found JSON data starting at position {json_start}, attempting to extract...")
-                        try:
-                            # Try to parse just the JSON portion
-                            power_data = json.loads(stdout_content[json_start:])
-                            print("Successfully extracted JSON portion!")
-                        except json.JSONDecodeError:
-                            print("Failed to extract valid JSON portion, falling back to text parsing.")
-                            power_data = parse_powermetrics_text(stdout_content)
-                    else:
-                        print("No JSON data found in the output, parsing text format instead.")
-                        power_data = parse_powermetrics_text(stdout_content)
+                    # Debug output
+                    print(f"\nFound {len(power_data.get('tasks', []))} tasks in powermetrics output")
                         
                     # If we couldn't parse the data at all, return empty results
                     if not power_data:
@@ -326,16 +316,18 @@ def get_app_energy_usage():
                         return defaultdict(lambda: {
                             'power_watts': 0.0,
                             'energy_impact_score': 0,
+                            'energy_impact_per_s': 0.0,
                             'consumption_12h': 0.0
                         })
                     
                     # Validate the parsed data
-                    if 'processor' not in power_data or 'tasks' not in power_data:
+                    if 'tasks' not in power_data:
                         print("Error: Invalid powermetrics data format.")
                         print(f"Available keys in power_data: {list(power_data.keys()) if isinstance(power_data, dict) else 'Not a dictionary'}")
                         return defaultdict(lambda: {
                             'power_watts': 0.0,
                             'energy_impact_score': 0,
+                            'energy_impact_per_s': 0.0,
                             'consumption_12h': 0.0
                         })
                         
@@ -348,6 +340,7 @@ def get_app_energy_usage():
                         return defaultdict(lambda: {
                             'power_watts': 0.0,
                             'energy_impact_score': 0,
+                            'energy_impact_per_s': 0.0,
                             'consumption_12h': 0.0
                         })
                     
@@ -362,17 +355,19 @@ def get_app_energy_usage():
                     for task in valid_tasks:
                         name = task['name']
                         energy_impact = task.get('energy_impact', 0)
+                        energy_impact_per_s = task.get('energy_impact_per_s', 0)
                         
                         # Skip tasks with no energy impact
                         if energy_impact <= 0:
                             continue
                             
                         # Calculate power usage based on energy impact proportion
-                        power_proportion = energy_impact / total_energy_impact
+                        power_proportion = energy_impact / total_energy_impact if total_energy_impact > 0 else 0
                         power_watts = total_power * power_proportion
                         
                         # Add to app_energy dictionary
                         app_energy[name]['energy_impact_score'] = int(energy_impact)
+                        app_energy[name]['energy_impact_per_s'] = energy_impact_per_s
                         app_energy[name]['power_watts'] = power_watts
                         app_energy[name]['consumption_12h'] = power_watts * 12
                         
@@ -380,9 +375,14 @@ def get_app_energy_usage():
                         if battery_info and power_watts > 0:
                             try:
                                 current_mwh = battery_info.get('current_mwh', 1000.0)
-                                time_impact_hours = power_watts / (current_mwh / 1000)
-                                app_energy[name]['time_impact_hours'] = time_impact_hours
-                                app_energy[name]['time_impact_minutes'] = time_impact_hours * 60
+                                # Ensure we're working with reasonable values
+                                if current_mwh > 0 and current_mwh < 100000:  # Sanity check for battery capacity
+                                    time_impact_hours = current_mwh / 1000 / power_watts  # Correct formula: capacity/power
+                                    app_energy[name]['time_impact_hours'] = time_impact_hours
+                                    app_energy[name]['time_impact_minutes'] = time_impact_hours * 60
+                                else:
+                                    app_energy[name]['time_impact_hours'] = 0
+                                    app_energy[name]['time_impact_minutes'] = 0
                             except Exception as e:
                                 app_energy[name]['time_impact_hours'] = 0
                                 app_energy[name]['time_impact_minutes'] = 0
@@ -393,12 +393,14 @@ def get_app_energy_usage():
                     # Return the app energy data
                     return app_energy
                     
-                except json.JSONDecodeError as e:
-                    print(f"\nJSON Decode Error: {e}")
-                    print(f"Error at position {e.pos}: character '{powermetrics_result.stdout[e.pos:e.pos+1]}'")
+                except Exception as e:
+                    print(f"\nError parsing plist data: {e}")
+                    import traceback
+                    traceback.print_exc()
                     return defaultdict(lambda: {
                         'power_watts': 0.0,
                         'energy_impact_score': 0,
+                        'energy_impact_per_s': 0.0,
                         'consumption_12h': 0.0
                     })
             except Exception as e:
@@ -514,11 +516,13 @@ def main():
         return
     
     print("ПОТРЕБЛЕНИЕ ЭНЕРГИИ ПРИЛОЖЕНИЯМИ:")
-    print("{:<30} {:>8} {:>12} {:>15} {:>15}".format(
-        "Приложение", "Энергия", "Текущее (Вт)", "За 12ч (Вт·ч)", "Влияние на время"))
+    print("{:<30} {:>8} {:>12} {:>15} {:>15} {:>15}".format(
+        "Приложение", "Энергия", "Энергия/с", "Текущее (Вт)", "За 12ч (Вт·ч)", "Влияние на время"))
     
-    # Sort apps by energy impact score if available, otherwise by power usage
-    if app_energy and any('energy_impact_score' in app_data for _, app_data in app_energy.items()):
+    # Sort apps by energy impact per second if available, otherwise by energy impact score
+    if app_energy and any('energy_impact_per_s' in app_data for _, app_data in app_energy.items()):
+        sorted_apps = sorted(app_energy.items(), key=lambda x: x[1].get('energy_impact_per_s', 0), reverse=True)
+    elif app_energy and any('energy_impact_score' in app_data for _, app_data in app_energy.items()):
         sorted_apps = sorted(app_energy.items(), key=lambda x: x[1].get('energy_impact_score', 0), reverse=True)
     else:
         sorted_apps = sorted(app_energy.items(), key=lambda x: x[1].get('power_watts', 0), reverse=True)
@@ -536,6 +540,9 @@ def main():
             # Energy impact score
             energy_impact = app_data.get('energy_impact_score', 0)
             
+            # Energy impact per second
+            energy_impact_per_s = app_data.get('energy_impact_per_s', 0)
+            
             # Current power usage
             current_power = app_data.get('power_watts', 0)
             
@@ -549,8 +556,8 @@ def main():
             else:
                 time_impact_fmt = f"{time_impact_minutes:.1f} мин"
                 
-            print("{:<30} {:>8} {:>12.2f} {:>15.1f} {:>15}".format(
-                app_name_fmt, energy_impact, current_power, consumption_12h, time_impact_fmt))
+            print("{:<30} {:>8} {:>12.2f} {:>12.2f} {:>15.1f} {:>15}".format(
+                app_name_fmt, energy_impact, energy_impact_per_s, current_power, consumption_12h, time_impact_fmt))
                 
         except Exception as e:
             # Skip this app if there's an error processing its data
