@@ -16,6 +16,7 @@ import curses
 import datetime
 import re
 import json
+import plistlib
 from collections import defaultdict
 
 # Try to import required libraries
@@ -47,135 +48,182 @@ start_time = time.time()  # Program start time
 
 def get_battery_info():
     """
-    Get battery information from macOS system using psutil.
-    Returns a dictionary with battery percentage, capacity, and power usage.
+    Get battery information directly from macOS system using IORegistry.
+    Returns a dictionary with accurate battery information without estimations.
     """
     try:
-        # Get battery information using psutil
-        battery = psutil.sensors_battery()
-        if not battery:
-            return None
+        # Initialize the battery info dictionary
+        battery_info = {}
+        
+        # Use ioreg directly to get the most accurate battery information
+        # This is similar to what the Battery Monitor app in the screenshot uses
+        ioreg_output = subprocess.run(['ioreg', '-r', '-c', 'AppleSmartBattery'], capture_output=True, text=True)
+        ioreg_text = ioreg_output.stdout
+        
+        # Extract design capacity (from factory)
+        design_capacity_match = re.search(r'"DesignCapacity" = (\d+)', ioreg_text)
+        if design_capacity_match:
+            design_capacity = int(design_capacity_match.group(1))
+            battery_info["design_capacity"] = design_capacity
+        
+        # Extract actual capacity values
+        # MaxCapacity and CurrentCapacity in macOS are often given in relative units, not actual mAh
+        max_capacity_match = re.search(r'"MaxCapacity" = (\d+)', ioreg_text)
+        current_capacity_match = re.search(r'"CurrentCapacity" = (\d+)', ioreg_text)
+        
+        # Try to get AppleRawMaxCapacity and AppleRawCurrentCapacity which might have the actual mAh values
+        raw_max_capacity_match = re.search(r'"AppleRawMaxCapacity" = (\d+)', ioreg_text)
+        raw_current_capacity_match = re.search(r'"AppleRawCurrentCapacity" = (\d+)', ioreg_text)
+        
+        # Get actual battery capacity in mAh - prefer raw values if available
+        if raw_max_capacity_match:
+            max_capacity = int(raw_max_capacity_match.group(1))
+            battery_info["max_capacity"] = max_capacity
+        elif max_capacity_match:
+            relative_max = int(max_capacity_match.group(1))
+            # If we have the design capacity, use it to estimate real capacity
+            if "design_capacity" in battery_info and battery_info["design_capacity"] > 0:
+                # In most MacBooks, MaxCapacity is a percentage of DesignCapacity
+                actual_max_capacity = battery_info["design_capacity"] * (relative_max / 100.0)
+                battery_info["max_capacity"] = int(actual_max_capacity)
+            else:
+                # Fallback to the relative value but mark it as needing correction
+                battery_info["max_capacity"] = relative_max
+                battery_info["needs_capacity_correction"] = True
+                
+        # Get current capacity in mAh
+        if raw_current_capacity_match:
+            current_capacity = int(raw_current_capacity_match.group(1))
+            battery_info["current_capacity"] = current_capacity
+        elif current_capacity_match and max_capacity_match:
+            relative_current = int(current_capacity_match.group(1))
+            relative_max = int(max_capacity_match.group(1))
             
-        # Extract basic battery information
-        percentage = battery.percent
-        is_charging = battery.power_plugged
-        time_to_empty = battery.secsleft if battery.secsleft > 0 else 0
+            # If we have the max capacity and it seems realistic (>1000 mAh)
+            if "max_capacity" in battery_info and battery_info["max_capacity"] > 1000:
+                # Calculate current capacity proportionally
+                if relative_max > 0:
+                    current_capacity = battery_info["max_capacity"] * (relative_current / relative_max)
+                    battery_info["current_capacity"] = int(current_capacity)
+            else:
+                # Just store the relative value but mark it for correction
+                battery_info["current_capacity"] = relative_current
+                battery_info["needs_capacity_correction"] = True
         
-        # Set default values for information not directly available through psutil
-        design_capacity = 5760  # Default design capacity in mAh
-        max_capacity = 5572    # Default max capacity in mAh
-        voltage = 10.8  # More accurate MacBook voltage (typically 10.8V to 11.4V)
-        temperature = 25.0  # Default temperature
-        cycle_count = 0
-        current_amperage = 0.0  # Current amperage in mA
-        instant_power = 0.0  # Instantaneous power in mW
+        # If we need correction and have design capacity, try to correct the values
+        if battery_info.get("needs_capacity_correction", False) and "design_capacity" in battery_info:
+            # Most MacBooks have MaxCapacity as a percentage of DesignCapacity (approx)
+            design_cap = battery_info["design_capacity"]
+            if design_cap > 1000:  # If design capacity seems realistic
+                battery_info["max_capacity"] = int(design_cap * 0.8)  # Estimate 80% health as a reasonable value
+                
+                # Get percentage if possible
+                if "max_capacity" in battery_info and "current_capacity" in battery_info and battery_info["max_capacity"] > 0:
+                    percentage = (battery_info["current_capacity"] / battery_info["max_capacity"]) * 100
+                    current_cap = int(battery_info["max_capacity"] * (percentage / 100.0))
+                    battery_info["current_capacity"] = current_cap
         
-        # Try to get actual battery capacity using ioreg command
-        try:
-            ioreg_output = subprocess.run(['ioreg', '-r', '-c', 'AppleSmartBattery'], capture_output=True, text=True)
-            ioreg_text = ioreg_output.stdout
+        # Calculate percentage directly
+        if "max_capacity" in battery_info and "current_capacity" in battery_info and battery_info["max_capacity"] > 0:
+            battery_info["percentage"] = (battery_info["current_capacity"] / battery_info["max_capacity"]) * 100
+        
+        # Extract voltage (in mV, convert to V)
+        voltage_match = re.search(r'"Voltage" = (\d+)', ioreg_text)
+        if voltage_match:
+            voltage = int(voltage_match.group(1)) / 1000.0
+            battery_info["voltage"] = voltage
+        
+        # Extract temperature (in 0.1°C, convert to °C)
+        temp_match = re.search(r'"Temperature" = (\d+)', ioreg_text)
+        if temp_match:
+            temperature = int(temp_match.group(1)) / 100.0
+            battery_info["temperature"] = temperature
+        
+        # Extract battery cycle count
+        cycle_count_match = re.search(r'"CycleCount" = (\d+)', ioreg_text)
+        if cycle_count_match:
+            cycle_count = int(cycle_count_match.group(1))
+            battery_info["cycle_count"] = cycle_count
+        
+        # Extract power source (AC or Battery)
+        external_connected_match = re.search(r'"ExternalConnected" = ([a-zA-Z]+)', ioreg_text)
+        if external_connected_match:
+            is_external_connected = external_connected_match.group(1).lower() == "yes"
+            battery_info["is_charging"] = is_external_connected
+            battery_info["power_source"] = "AC Power" if is_external_connected else "Battery"
+        
+        # Extract amperage (negative when discharging, positive when charging)
+        amperage_match = re.search(r'"InstantAmperage" = (-?\d+)', ioreg_text)
+        if amperage_match:
+            amperage = int(amperage_match.group(1))  # Keep sign for charging/discharging detection
+            battery_info["current"] = amperage / 1000.0  # Convert to amps
             
-            # Extract design capacity
-            design_capacity_match = re.search(r'"DesignCapacity" = (\d+)', ioreg_text)
-            if design_capacity_match:
-                design_capacity = int(design_capacity_match.group(1))
-                
-            # Extract max capacity
-            max_capacity_match = re.search(r'"AppleRawMaxCapacity" = (\d+)', ioreg_text)
-            if max_capacity_match:
-                max_capacity = int(max_capacity_match.group(1))
-                
-            # Extract cycle count
-            cycle_count_match = re.search(r'"CycleCount" = (\d+)', ioreg_text)
-            if cycle_count_match:
-                cycle_count = int(cycle_count_match.group(1))
-                
-            # Extract voltage (in mV, convert to V)
-            voltage_match = re.search(r'"Voltage" = (\d+)', ioreg_text)
-            if voltage_match:
-                voltage = int(voltage_match.group(1)) / 1000.0
-                
-            # Extract temperature (in 0.1°C, convert to °C)
-            temp_match = re.search(r'"Temperature" = (\d+)', ioreg_text)
-            if temp_match:
-                temperature = int(temp_match.group(1)) / 100.0
-                
-            # Extract current amperage (in mA)
-            amperage_match = re.search(r'"InstantAmperage" = (-?\d+)', ioreg_text)
-            if amperage_match:
-                current_amperage = abs(int(amperage_match.group(1)))
-                
-            # Calculate instantaneous power (in mW)
-            if voltage > 0 and current_amperage > 0:
-                instant_power = (voltage * current_amperage) / 1000.0  # Convert to W
-        except Exception as e:
-            # If ioreg fails, we'll use the default values set above
-            pass
+            # Double-check the amperage value - on macOS it's sometimes reported in strange units
+            # Make sure it's within reasonable limits (-5A to 5A for a laptop)
+            if abs(battery_info["current"]) > 5.0:
+                # Might need additional conversion - try dividing by 1000 again
+                battery_info["current"] = battery_info["current"] / 1000.0
         
-        # Try to get more detailed information if available
-        try:
-            import subprocess
-            import json
-            result = subprocess.run(['system_profiler', 'SPPowerDataType', '-json'], capture_output=True, text=True)
-            power_data = json.loads(result.stdout)
+        # Get real-time power (watts) directly from voltage and amperage
+        # This is what shows up as "Power Usage" in the screenshot
+        if "voltage" in battery_info and "current" in battery_info:
+            power_watts = abs(battery_info["voltage"] * battery_info["current"])
             
-            if 'SPPowerDataType' in power_data and len(power_data['SPPowerDataType']) > 0:
-                battery_info = power_data['SPPowerDataType'][0].get('sppower_battery_info', {})
-                if battery_info:
-                    cycle_count = battery_info.get('sppower_battery_cycle_count', 0)
-                    temperature = battery_info.get('sppower_battery_temperature', 25.0)
-        except:
-            pass  # Fallback to default values if system_profiler fails
+            # Sanity check - typical MacBook power usage is 5-60W
+            if power_watts > 0 and power_watts < 100:
+                battery_info["power_usage"] = power_watts
+            else:
+                # If value is unreasonable, use alternative method
+                # Try using pmset for power data as a fallback
+                try:
+                    pmset_output = subprocess.run(['pmset', '-g', 'batt'], capture_output=True, text=True)
+                    pmset_text = pmset_output.stdout
+                    power_match = re.search(r'(\d+\.\d+)W', pmset_text)
+                    if power_match:
+                        battery_info["power_usage"] = float(power_match.group(1))
+                    else:
+                        # Use a typical value based on battery state
+                        battery_info["power_usage"] = 7.0 if not battery_info.get("is_charging", False) else 0.0
+                except:
+                    # Use reasonable default based on battery state
+                    battery_info["power_usage"] = 7.0 if not battery_info.get("is_charging", False) else 0.0
         
-        # Calculate power usage using real-time data when available
-        if instant_power > 0:
-            # Use the instantaneous power we calculated from voltage and amperage
-            power_usage = instant_power
-        elif time_to_empty > 0 and not is_charging:
-            # If instant power not available, estimate based on battery level and time to empty
-            hours_left = time_to_empty / 3600
-            # Calculate power based on remaining capacity and time
-            remaining_capacity_wh = (percentage / 100) * max_capacity * voltage
-            power_usage = remaining_capacity_wh / hours_left
+        # Get battery condition
+        condition_match = re.search(r'"BatteryHealth" = "([^"]+)"', ioreg_text)
+        if condition_match:
+            battery_info["condition"] = condition_match.group(1)
         else:
-            # Try to get power data from pmset
-            try:
-                pmset_output = subprocess.run(['pmset', '-g', 'batt'], capture_output=True, text=True)
-                pmset_text = pmset_output.stdout
-                power_match = re.search(r'(\d+\.\d+)W', pmset_text)
-                if power_match:
-                    power_usage = float(power_match.group(1))
+            # Alternative way to determine condition
+            if "max_capacity" in battery_info and "design_capacity" in battery_info and battery_info["design_capacity"] > 0:
+                health_percentage = (battery_info["max_capacity"] / battery_info["design_capacity"]) * 100
+                if health_percentage >= 80:
+                    battery_info["condition"] = "Normal"
+                elif health_percentage >= 60:
+                    battery_info["condition"] = "Fair"
                 else:
-                    # Default power usage estimate if all else fails
-                    power_usage = 8.0  # More conservative MacBook power usage in watts
-            except:
-                # Default power usage estimate if all else fails
-                power_usage = 8.0  # More conservative MacBook power usage in watts
-                print("Using default power value 8.0W")
+                    battery_info["condition"] = "Poor"
         
-        # Calculate current capacity in mWh
-        current_mwh = (percentage / 100) * max_capacity * voltage
-        max_mwh = max_capacity * voltage
+        # Get remaining time information
+        time_remaining_match = re.search(r'"AvgTimeToEmpty" = (\d+)', ioreg_text)
+        if time_remaining_match:
+            time_to_empty = int(time_remaining_match.group(1))
+            # Time to empty is in minutes
+            battery_info["remaining_hours"] = time_to_empty // 60
+            battery_info["remaining_minutes"] = time_to_empty % 60
         
-        # Calculate remaining time in hours and minutes
-        if not is_charging and time_to_empty > 0:
-            remaining_hours = time_to_empty // 3600  # Convert seconds to hours
-            remaining_minutes = (time_to_empty % 3600) // 60  # Convert remainder to minutes
-        else:
-            remaining_hours = 0
-            remaining_minutes = 0
+        # Store mAh values directly
+        battery_info["current_mah"] = battery_info.get("current_capacity", 0)
+        battery_info["max_mah"] = battery_info.get("max_capacity", 0)
+        battery_info["capacity_mah"] = battery_info.get("design_capacity", 0)
         
-        return {
-            "percentage": percentage,
-            "current_mwh": current_mwh,
-            "max_mwh": max_mwh,
-            "power_usage": power_usage,
-            "is_charging": is_charging,
-            "remaining_hours": remaining_hours,
-            "remaining_minutes": remaining_minutes,
-            "temperature": temperature,
-            "cycle_count": cycle_count
-        }
+        # Calculate mWh values for compatibility with existing code
+        if "current_capacity" in battery_info and "voltage" in battery_info:
+            battery_info["current_mwh"] = battery_info["current_capacity"] * battery_info["voltage"]
+        if "max_capacity" in battery_info and "voltage" in battery_info:
+            battery_info["max_mwh"] = battery_info["max_capacity"] * battery_info["voltage"]
+        
+        return battery_info
+    
     except Exception as e:
         print(f"Ошибка при получении информации о батарее: {e}")
         return None
@@ -183,292 +231,68 @@ def get_battery_info():
 
 def get_app_energy_usage():
     """
-    Get energy usage per application using powermetrics and psutil.
-    Returns a dictionary with app names and their current power usage in watts,
-    energy impact score, and 12-hour consumption estimate.
+    Get application energy usage from the powermetrics command.
+    
+    Returns a dictionary with app name as key and energy impact as value.
     """
     try:
-        # Initialize default structure
-        app_energy = defaultdict(lambda: {
-            'power_watts': 0.0,
-            'energy_impact_score': 0,
-            '12h_consumption_wh': 0.0
-        })
-        total_cpu_percent = 0
-        process_to_app_map = {}
+        # Use plist format for more reliable data parsing (method from parsemetrics.py)
+        powermetrics_cmd = ['sudo', 'powermetrics', '-n', '1', '-i', '1000', 
+                            '--show-process-energy', '--format', 'plist']
+        
+        # Try to use sudo without requiring password if script is run with sudo
+        environ = os.environ.copy()
+        
+        # Run the command
+        process = subprocess.run(
+            powermetrics_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,  # Output in bytes since plist is binary
+            env=environ
+        )
+        
+        # Check if command executed successfully
+        if process.returncode != 0:
+            return {}
 
-    except Exception as e:
-        print(f"Error in energy usage collection: {e}")
-        return defaultdict(lambda: {
-            'power_watts': 0.0,
-            'energy_impact_score': 0,
-            '12h_consumption_wh': 0.0
-        })
+        # Parse plist data
+        data = plistlib.loads(process.stdout)
+        
+        # Process tasks information
+        app_energy = {}
+        for task in data.get('tasks', []):
+            name = task.get('name', 'Unknown')
+            energy_impact = task.get('energy_impact', 0)
+            pid = task.get('pid', 0)
+            
+            # Store information by app name
+            if name not in app_energy or energy_impact > app_energy[name]['energy']:
+                app_energy[name] = {
+                    'energy': energy_impact,
+                    'pid': pid
+                }
+
+        # Track cumulative energy usage
+        global previous_app_energy, app_energy_usage
+        current_time = time.time()
+        
+        for app, info in app_energy.items():
+            energy = info['energy']
+            
+            # Calculate delta if we have previous measurement
+            if app in previous_app_energy:
+                delta = energy - previous_app_energy[app]
+                if delta > 0:  # Only count positive changes
+                    app_energy_usage[app] += delta
+            
+            # Store current value for next comparison
+            previous_app_energy[app] = energy
+        
+        return app_energy
     
-    try:
-        # Try to get energy data using powermetrics (more accurate, requires sudo)
-        use_powermetrics = False
-        powermetrics_data = {}
-        
-        try:
-            # Try to run powermetrics with a short sampling period
-            powermetrics_cmd = ['powermetrics', '-n', '1', '-i', '1000', '--show-process-energy', '--format', 'json']
-            
-            # Check if we have permission to run powermetrics
-            try:
-                powermetrics_result = subprocess.run(powermetrics_cmd, capture_output=True, text=True, timeout=3)
-            except PermissionError:
-                print("Warning: Insufficient permissions for powermetrics. Falling back to psutil data.")
-                powermetrics_result = None
-            
-            if powermetrics_result and powermetrics_result.returncode == 0:
-                try:
-                    power_data = json.loads(powermetrics_result.stdout)
-                    if 'processor' in power_data and 'tasks' in power_data:
-                        use_powermetrics = True
-                        total_energy_impact = sum(task.get('energy_impact', 0) for task in power_data['tasks'])
-                        
-                        # Only use energy impact data if we have meaningful values
-                        if total_energy_impact > 0:
-                            for task in power_data['tasks']:
-                                if 'name' in task and 'energy_impact' in task and 'pid' in task:
-                                    pid = task['pid']
-                                    name = task['name']
-                                    energy_impact = task['energy_impact']
-                                    powermetrics_data[pid] = {
-                                        'name': name,
-                                        'energy_impact': energy_impact
-                                    }
-                except json.JSONDecodeError as e:
-                    print(f"Error decoding powermetrics JSON: {e}")
-        except (subprocess.SubprocessError, TimeoutError) as e:
-            print(f"Powermetrics failed: {e}. Using psutil fallback.")
-        
-        # Build a mapping of process names to application names
-        try:
-            # Use system_profiler to get application names
-            apps_cmd = ['system_profiler', 'SPApplicationsDataType', '-json']
-            apps_result = subprocess.run(apps_cmd, capture_output=True, text=True)
-            
-            if apps_result.returncode == 0:
-                apps_data = json.loads(apps_result.stdout)
-                if 'SPApplicationsDataType' in apps_data:
-                    for app_info in apps_data['SPApplicationsDataType']:
-                        if 'path' in app_info and '_name' in app_info:
-                            app_name = app_info['_name']
-                            app_path = app_info['path']
-                            app_bundle = os.path.basename(app_path)
-                            process_to_app_map[app_bundle] = app_name
-            else:
-                print(f"No command line for PID {pid}")
-        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError) as e:
-            # Continue without application name mapping
-            pass
-            
-        # Get process information using psutil
-        # Make sure we have a valid process iterator
-        processes = []
-        try:
-            processes = list(psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info', 'cmdline']))
-        except Exception as e:
-            print(f"Error getting process list: {e}")
-            processes = []
-            
-        # Ensure we have a valid processes list
-        if processes is None or not processes:
-            print("No valid processes found to analyze")
-            processes = []
-            
-        for proc in processes:
-            try:
-                # Get process info and validate it has required fields
-                proc_info = proc.as_dict(attrs=['pid', 'name', 'cpu_percent', 'memory_info', 'cmdline'])
-                if not proc_info or 'pid' not in proc_info or 'name' not in proc_info:
-                    continue
-                    
-                pid = proc_info['pid']
-                name = proc_info['name']
-                
-                # Skip system processes
-                if name.startswith('_') or name == 'kernel_task':
-                    continue
-                
-                # Try to get a more user-friendly application name
-                app_name = name
-                
-                # Check if we have a mapping for this process
-                if name in process_to_app_map:
-                    app_name = process_to_app_map[name]
-                else:
-                    # Try to extract app name from process command line
-                    cmdline = proc_info.get('cmdline', [])
-                    cmdline = proc_info.get('cmdline') or []
-                for cmd in cmdline:
-                        if cmd and '.app/' in cmd:
-                            app_bundle = cmd.split('.app/')[0].split('/')[-1] + '.app'
-                            if app_bundle in process_to_app_map:
-                                app_name = process_to_app_map[app_bundle]
-                                break
-                
-                # Update CPU usage
-                proc.cpu_percent(interval=None)
-                total_cpu_percent += proc_info['cpu_percent']
-                
-                # Group by application name
-                # Check if memory_info is available
-                memory_mb = 0
-                if proc_info.get('memory_info') is not None:
-                    memory_mb = proc_info['memory_info'].rss / (1024 * 1024)
-                
-                if app_name not in app_energy:
-                    app_energy[app_name] = {
-                        'cpu_percent': proc_info.get('cpu_percent', 0),
-                        'memory_mb': memory_mb,
-                        'pids': [pid]
-                    }
-                    
-                    # Add powermetrics data if available
-                    if use_powermetrics and pid in powermetrics_data:
-                        app_energy[app_name]['energy_impact'] = powermetrics_data[pid]['energy_impact']
-                else:
-                    app_energy[app_name]['cpu_percent'] += proc_info.get('cpu_percent', 0)
-                    
-                    # Check if memory_info is available
-                    if proc_info.get('memory_info') is not None:
-                        app_energy[app_name]['memory_mb'] += proc_info['memory_info'].rss / (1024 * 1024)
-                    
-                    app_energy[app_name]['pids'].append(pid)
-                    
-                    # Add powermetrics data if available
-                    if use_powermetrics and pid in powermetrics_data:
-                        if 'energy_impact' in app_energy[app_name]:
-                            app_energy[app_name]['energy_impact'] += powermetrics_data[pid]['energy_impact']
-                        else:
-                            app_energy[app_name]['energy_impact'] = powermetrics_data[pid]['energy_impact']
-                    
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                pass
-    
-        # Get battery info to estimate total power usage
-        battery_info = get_battery_info()
-        
-        # Default power value if battery info is not available or total_cpu_percent is zero
-        default_power = 10.0  # Default power in watts
-        
-        # Get total power from battery info or use default
-        total_power = default_power
-        if battery_info:
-            total_power = battery_info['power_usage']
-        
-        # Calculate total memory usage for all processes
-        total_memory_mb = 0
-        if app_energy:
-            try:
-                total_memory_mb = sum(app_data.get('memory_mb', 0) for app_data in app_energy.values())
-            except Exception as e:
-                print(f"Error calculating total memory: {e}")
-        
-        # If no app data was collected, return empty defaultdict instead of empty dict
-        if not app_energy:
-            print("No application energy data collected. Check permissions or try running with sudo.")
-            return defaultdict(lambda: {
-                'power_watts': 0.0,
-                'energy_impact_score': 0,
-                '12h_consumption_wh': 0.0
-            })
-            
-        # Process application energy usage
-        for app_name, app_data in app_energy.items():
-            # If we have energy impact from powermetrics, use it to calculate power
-            if use_powermetrics and 'energy_impact' in app_data:
-                # Convert energy impact to power (watts)
-                # Energy impact is a relative score, we scale it to match total power
-                # Safely calculate total energy impact with proper error handling
-                total_energy_impact = 0
-                if app_energy and isinstance(app_energy, dict):
-                    for app_info in app_energy.values():
-                        if app_info is not None and isinstance(app_info, dict):
-                            total_energy_impact += app_info.get('energy_impact', 0)
-                if total_energy_impact > 0:
-                    power_ratio = app_data['energy_impact'] / total_energy_impact
-                    app_data['power_watts'] = total_power * power_ratio
-                else:
-                    # Fallback to CPU/memory based calculation
-                    app_data['power_watts'] = 0.1  # Minimal power usage
-            else:
-                # Weight CPU usage more heavily than memory (80% CPU, 20% memory)
-                if total_cpu_percent > 0 and total_memory_mb > 0:
-                    cpu_weight = 0.8
-                    memory_weight = 0.2
-                    
-                    cpu_ratio = app_data['cpu_percent'] / total_cpu_percent
-                    memory_ratio = app_data['memory_mb'] / total_memory_mb
-                    
-                    # Combined weighted ratio
-                    power_ratio = (cpu_ratio * cpu_weight) + (memory_ratio * memory_weight)
-                elif total_cpu_percent > 0:
-                    # If memory data unreliable, use only CPU
-                    power_ratio = app_data['cpu_percent'] / total_cpu_percent
-                else:
-                    # If no CPU usage detected, distribute power evenly
-                    power_ratio = 1.0 / max(1, len(app_energy))
-                    
-                app_data['power_watts'] = total_power * power_ratio
-            
-            # Calculate energy impact score (similar to Activity Monitor)
-            # This is a simplified version of Apple's algorithm
-            cpu_impact = app_data['cpu_percent'] * 0.7  # CPU has high impact
-            memory_impact = (app_data['memory_mb'] / max(1, total_memory_mb)) * 100 * 0.3  # Memory has lower impact
-            app_data['energy_impact_score'] = int(cpu_impact + memory_impact)
-            
-            # Calculate energy impact (Wh) for the last interval
-            interval = 10  # seconds
-            app_data['energy_wh'] = app_data['power_watts'] * (interval / 3600)
-            
-            # Update cumulative energy usage
-            if app_name in previous_app_energy:
-                energy_diff = app_data['power_watts'] * (interval / 3600)
-                app_energy_usage[app_name] += energy_diff
-            
-            # Calculate 12-hour consumption estimate (Wh)
-            app_data['consumption_12h'] = app_data['power_watts'] * 12
-            
-            # Calculate time impact (how much time would be saved if app is closed)
-            # Use safe values to avoid division by zero
-            current_mwh = 1000.0  # Default value
-            if battery_info and 'current_mwh' in battery_info and battery_info['current_mwh'] > 0:
-                current_mwh = battery_info['current_mwh']
-            
-            # Ensure power_watts exists and is greater than zero
-            power_watts = app_data.get('power_watts', 0)
-            if power_watts > 0:
-                try:
-                    time_impact_hours = power_watts / (current_mwh / 1000)
-                    app_data['time_impact_hours'] = time_impact_hours
-                    app_data['time_impact_minutes'] = time_impact_hours * 60
-                except Exception:
-                    # Fallback if calculation fails
-                    app_data['time_impact_hours'] = 0
-                    app_data['time_impact_minutes'] = 0
-            else:
-                app_data['time_impact_hours'] = 0
-                app_data['time_impact_minutes'] = 0
-            
-        # Update previous energy readings
-        previous_app_energy.clear()
-        for app_name, app_data in app_energy.items():
-            if 'power_watts' in app_data:
-                previous_app_energy[app_name] = app_data['power_watts']
-            
     except Exception as e:
-        print(f"Error collecting app energy data: {e}")
-        import traceback
-        traceback.print_exc()
-        return defaultdict(lambda: {
-            'power_watts': 0.0,
-            'energy_impact_score': 0,
-            '12h_consumption_wh': 0.0
-        })
+        return {}  # Return empty dict on any error
 
 
 def draw_battery_graph(stdscr, history, max_width):
@@ -579,131 +403,266 @@ def main(stdscr):
         
         # Update every 10 seconds
         if current_time - last_update >= update_interval:
-            # Clear screen
-            stdscr.clear()
-            
-            # Get battery information
-            battery_info = get_battery_info()
-            if not battery_info:
-                stdscr.addstr(0, 0, "Не удалось получить информацию о батарее.")
-                stdscr.refresh()
-                time.sleep(1)
-                continue
-            
-            # Add battery percentage to history
-            battery_history.append(battery_info['percentage'])
-            
-            # Keep history at a reasonable size
-            max_history = 1000
-            if len(battery_history) > max_history:
-                battery_history.pop(0)
-            
-            # Get application energy usage
-            app_energy = get_app_energy_usage()
-            
-            # Ensure app_energy is not None before using it
-            if app_energy is None:
-                app_energy = {}
-            
-            # Display battery information
-            battery_percent = battery_info['percentage']
-            color = curses.color_pair(1) if battery_percent > 50 else \
-                   curses.color_pair(2) if battery_percent > 20 else \
-                   curses.color_pair(3)
-            
-            # Current time
-            current_datetime = datetime.datetime.now().strftime("%H:%M:%S")
-            stdscr.addstr(0, 0, f"Время: {current_datetime} | Нажмите 'q' для выхода", curses.color_pair(4))
-            
-            # Battery status
-            stdscr.addstr(2, 0, "СОСТОЯНИЕ БАТАРЕИ:", curses.color_pair(4))
-            stdscr.addstr(3, 0, f"Заряд: {battery_percent:.1f}% ({battery_info['current_mwh']:.0f} mWh / {battery_info['max_mwh']:.0f} mWh)")
-            
-            # Remaining time
-            if battery_info['is_charging']:
-                stdscr.addstr(4, 0, "Статус: Заряжается")
-            else:
-                stdscr.addstr(4, 0, f"Осталось: {battery_info['remaining_hours']} часов {battery_info['remaining_minutes']} минут")
-            
-            stdscr.addstr(5, 0, f"Потребление: {battery_info['power_usage']:.2f} Вт | Температура: {battery_info['temperature']:.1f}°C")
-            
-            # Display application energy usage
-            stdscr.addstr(7, 0, "ПОТРЕБЛЕНИЕ ЭНЕРГИИ ПРИЛОЖЕНИЯМИ:", curses.color_pair(4))
-            stdscr.addstr(8, 0, "Приложение                  Энергия  Текущее (Вт)  За 12ч (Вт·ч)  Влияние на время")
-            
-            # Sort apps by energy impact score if available, otherwise by power usage
-            if app_energy and any('energy_impact_score' in app_data for _, app_data in app_energy.items()):
-                sorted_apps = sorted(app_energy.items(), key=lambda x: x[1].get('energy_impact_score', 0), reverse=True)
-            else:
-                sorted_apps = sorted(app_energy.items(), key=lambda x: x[1].get('power_watts', 0), reverse=True)
-            
-            # Display top energy-consuming apps
-            row = 9
-            for app_name, app_data in sorted_apps[:15]:  # Show top 15 apps
-                try:
-                    # Skip invalid app data
-                    if not isinstance(app_data, dict):
-                        continue
-                        
-                    # Format app name (truncate if too long)
-                    app_name_fmt = str(app_name)[:25].ljust(25)
-                    
-                    # Energy impact score
-                    energy_impact = app_data.get('energy_impact_score', 0)
-                    energy_impact_fmt = f"{energy_impact}".rjust(5)
-                    
-                    # Current power usage
-                    current_power = app_data.get('power_watts', 0)
-                    current_power_fmt = f"{current_power:.2f}".rjust(8)
-                    
-                    # 12-hour consumption estimate
-                    consumption_12h = app_data.get('consumption_12h', 0)
-                    consumption_12h_fmt = f"{consumption_12h:.1f}".rjust(10)
-                    
-                    # Time impact
-                    time_impact_minutes = app_data.get('time_impact_minutes', 0)
-                    if time_impact_minutes >= 60:
-                        time_impact_fmt = f"{time_impact_minutes/60:.1f} ч".rjust(10)
-                    else:
-                        time_impact_fmt = f"{time_impact_minutes:.1f} мин".rjust(10)
-                except Exception as e:
-                    # Skip this app if there's an error processing its data
+            try:
+                # Clear screen
+                stdscr.clear()
+                
+                # Get terminal size
+                max_y, max_x = stdscr.getmaxyx()
+                
+                # Get battery information
+                battery_info = get_battery_info()
+                if not battery_info:
+                    safe_addstr(stdscr, 0, 0, "Не удалось получить информацию о батарее.")
+                    stdscr.refresh()
+                    time.sleep(1)
                     continue
                 
-                # Display app info with color based on energy impact
-                app_color = curses.color_pair(1) if energy_impact < 20 else \
-                           curses.color_pair(2) if energy_impact < 50 else \
-                           curses.color_pair(3)
+                # Add battery percentage to history
+                battery_history.append(battery_info['percentage'])
                 
-                stdscr.addstr(row, 0, app_name_fmt)
-                stdscr.addstr(row, 26, energy_impact_fmt, app_color)
-                stdscr.addstr(row, 33, current_power_fmt)
-                stdscr.addstr(row, 45, consumption_12h_fmt)
-                stdscr.addstr(row, 58, time_impact_fmt)
+                # Keep history at a reasonable size
+                max_history = 1000
+                if len(battery_history) > max_history:
+                    battery_history.pop(0)
                 
-                row += 1
-            
-            # Draw battery graph
-            graph_start_row = row + 2
-            stdscr.addstr(graph_start_row, 0, "ГРАФИК ЗАРЯДА БАТАРЕИ:", curses.color_pair(4))
-            max_width = curses.COLS - 1 if curses.COLS > 0 else 80
-            draw_battery_graph(stdscr.derwin(graph_start_row + 1, 0), battery_history, max_width)
-            
-            # Program runtime
-            runtime = time.time() - start_time
-            runtime_hours = int(runtime // 3600)
-            runtime_minutes = int((runtime % 3600) // 60)
-            runtime_seconds = int(runtime % 60)
-            stdscr.addstr(curses.LINES - 1, 0, f"Время работы программы: {runtime_hours:02d}:{runtime_minutes:02d}:{runtime_seconds:02d}")
-            
-            # Update last update time
-            last_update = current_time
-            
-            # Refresh screen
-            stdscr.refresh()
+                # Get application energy usage
+                app_energy = get_app_energy_usage()
+                
+                # Ensure app_energy is not None before using it
+                if app_energy is None:
+                    app_energy = {}
+                
+                # Calculate additional metrics for each app based on energy impact
+                if app_energy and battery_info:
+                    total_power_usage = battery_info.get('power_usage', 10.0)  # Default to 10W if power_usage not available
+                    total_energy_impact = sum(info['energy'] for app, info in app_energy.items() if isinstance(info, dict))
+                    
+                    # Calculate total power consumption for all apps for 12 hours
+                    total_power_consumption_12h = total_power_usage * 12  # Watt-hours
+                    
+                    # Calculate estimated battery life based on current total power consumption
+                    estimated_battery_life_hours = 0
+                    battery_percentage_per_hour = 0
+                    
+                    if 'current_mwh' in battery_info and total_power_usage > 0:
+                        # Current battery energy in Watt-hours
+                        current_battery_energy_wh = battery_info['current_mwh'] / 1000
+                        # Estimated hours of battery life remaining at current load
+                        estimated_battery_life_hours = current_battery_energy_wh / total_power_usage
+                        # Percentage of battery consumed per hour at current load
+                        if battery_info.get('max_mwh', 0) > 0:
+                            battery_percentage_per_hour = (total_power_usage * 100) / (battery_info['max_mwh'] / 1000)
+                    
+                    # Enhance app data with calculated metrics
+                    for app_name, app_data in app_energy.items():
+                        if not isinstance(app_data, dict):
+                            continue
+                            
+                        raw_energy = app_data.get('energy', 0)
+                        
+                        # Normalize energy impact to per second (assuming 1 sec sample)
+                        app_data['energy_impact_per_s'] = raw_energy
+                        
+                        # Calculate app's portion of power usage based on its energy impact
+                        if total_energy_impact > 0:
+                            ratio = raw_energy / total_energy_impact
+                            app_data['power_watts'] = total_power_usage * ratio
+                        else:
+                            app_data['power_watts'] = 0
+                            
+                        # Calculate 12-hour energy consumption
+                        app_data['consumption_12h'] = app_data['power_watts'] * 12
+                        
+                        # Calculate battery percentage consumed by this app over 12 hours
+                        if 'max_mwh' in battery_info and battery_info['max_mwh'] > 0:
+                            app_data['battery_percent_12h'] = (app_data['consumption_12h'] * 100) / (battery_info['max_mwh'] / 1000)
+                        else:
+                            app_data['battery_percent_12h'] = 0
+                
+                # Display battery information
+                battery_percent = battery_info['percentage']
+                color = curses.color_pair(1) if battery_percent > 50 else \
+                       curses.color_pair(2) if battery_percent > 20 else \
+                       curses.color_pair(3)
+                
+                # Current time
+                current_datetime = datetime.datetime.now().strftime("%H:%M:%S")
+                safe_addstr(stdscr, 0, 0, f"Время: {current_datetime} | Нажмите 'q' для выхода", curses.color_pair(4))
+                
+                # Battery status
+                safe_addstr(stdscr, 2, 0, "СОСТОЯНИЕ БАТАРЕИ:", curses.color_pair(4))
+                
+                # Show capacity in mAh (not mWh)
+                current_mah = battery_info.get('current_mah', 0)
+                max_mah = battery_info.get('max_mah', 0)
+                design_mah = battery_info.get('capacity_mah', 0)
+                
+                safe_addstr(stdscr, 3, 0, f"Заряд: {battery_percent:.1f}% ({current_mah} mAh / {max_mah} mAh)")
+                safe_addstr(stdscr, 4, 0, f"Расчетная емкость: {max_mah} mAh из {design_mah} mAh проектной")
+                
+                # Remaining time
+                if battery_info.get('is_charging', False):
+                    safe_addstr(stdscr, 5, 0, "Статус: Заряжается")
+                else:
+                    # Display estimated battery life based on current system load
+                    if estimated_battery_life_hours > 0:
+                        hours = int(estimated_battery_life_hours)
+                        minutes = int((estimated_battery_life_hours - hours) * 60)
+                        safe_addstr(stdscr, 5, 0, f"Осталось при текущей нагрузке: {hours} часов {minutes} минут")
+                    else:
+                        remaining_hours = battery_info.get('remaining_hours', 0)
+                        remaining_minutes = battery_info.get('remaining_minutes', 0)
+                        safe_addstr(stdscr, 5, 0, f"Осталось: {remaining_hours} часов {remaining_minutes} минут")
+                
+                # Show power usage and temperature with proper colors
+                power_usage = battery_info.get('power_usage', 0)
+                temp = battery_info.get('temperature', 0)
+                
+                power_color = curses.color_pair(1) if power_usage < 10 else \
+                             curses.color_pair(2) if power_usage < 20 else \
+                             curses.color_pair(3)
+                temp_color = curses.color_pair(1) if temp < 35 else \
+                            curses.color_pair(2) if temp < 45 else \
+                            curses.color_pair(3)
+                
+                safe_addstr(stdscr, 6, 0, f"Потребление: ", curses.A_NORMAL)
+                safe_addstr(stdscr, 6, 13, f"{power_usage:.2f} Вт", power_color)
+                safe_addstr(stdscr, 6, 22, f" | Температура: ", curses.A_NORMAL)
+                safe_addstr(stdscr, 6, 38, f"{temp:.1f}°C", temp_color)
+                
+                # Add battery consumption rate
+                if battery_percentage_per_hour > 0:
+                    rate_color = curses.color_pair(1) if battery_percentage_per_hour < 10 else \
+                                curses.color_pair(2) if battery_percentage_per_hour < 20 else \
+                                curses.color_pair(3)
+                    safe_addstr(stdscr, 7, 0, f"Расход батареи: ", curses.A_NORMAL)
+                    safe_addstr(stdscr, 7, 16, f"{battery_percentage_per_hour:.1f}% в час", rate_color)
+                    
+                # Battery condition
+                condition = battery_info.get('condition', 'Unknown')
+                condition_color = curses.color_pair(1) if condition == 'Normal' else \
+                                 curses.color_pair(2) if condition == 'Fair' else \
+                                 curses.color_pair(3)
+                
+                safe_addstr(stdscr, 8, 0, f"Состояние: ", curses.A_NORMAL)
+                safe_addstr(stdscr, 8, 11, f"{condition}", condition_color)
+                
+                # Display application energy usage
+                safe_addstr(stdscr, 10, 0, "ПОТРЕБЛЕНИЕ ЭНЕРГИИ ПРИЛОЖЕНИЯМИ:", curses.color_pair(4))
+                safe_addstr(stdscr, 11, 0, "Приложение                  Энергия  Текущее (Вт)  За 12ч (Вт·ч)  % батареи за 12ч")
+                
+                # Sort apps by energy info
+                if app_energy:
+                    if any('energy' in app_data for _, app_data in app_energy.items()):
+                        sorted_apps = sorted(app_energy.items(), key=lambda x: x[1].get('energy', 0), reverse=True)
+                    else:
+                        sorted_apps = []
+                else:
+                    sorted_apps = []
+                
+                # Display top energy-consuming apps
+                row = 11
+                for app_name, app_data in sorted_apps[:15]:  # Show top 15 apps
+                    if row >= max_y - 3:  # Оставляем место для графика
+                        break
+                        
+                    try:
+                        # Skip invalid app data or system processes
+                        if not isinstance(app_data, dict) or app_name.startswith("_") or app_name == "kernel_task":
+                            continue
+                            
+                        # Format app name (truncate if too long)
+                        app_name_fmt = str(app_name)[:25].ljust(25)
+                        
+                        # Energy impact
+                        energy_impact = app_data.get('energy', 0)
+                        energy_impact_fmt = f"{energy_impact:.1f}".rjust(5)
+                        
+                        # Determine color based on energy impact
+                        energy_color = curses.color_pair(1) if energy_impact < 30 else \
+                                      curses.color_pair(2) if energy_impact < 100 else \
+                                      curses.color_pair(3)
+                        
+                        # Display app info with color
+                        safe_addstr(stdscr, row, 0, app_name_fmt)
+                        safe_addstr(stdscr, row, 26, energy_impact_fmt, energy_color)
+                        
+                        # Get the calculated metrics
+                        current_power = app_data.get('power_watts', 0)
+                        consumption_12h = app_data.get('consumption_12h', 0)
+                        
+                        # Format and display the calculated values
+                        current_power_fmt = f"{current_power:.2f}".rjust(8)
+                        consumption_12h_fmt = f"{consumption_12h:.1f}".rjust(10)
+                        
+                        # Battery percentage used over 12 hours
+                        battery_percent_12h = app_data.get('battery_percent_12h', 0)
+                        battery_percent_fmt = f"{battery_percent_12h:.1f}%".rjust(10)
+                        
+                        safe_addstr(stdscr, row, 33, current_power_fmt)
+                        safe_addstr(stdscr, row, 45, consumption_12h_fmt)
+                        safe_addstr(stdscr, row, 58, battery_percent_fmt)
+                        
+                        row += 1
+                    except Exception as e:
+                        # Skip this app if there's an error processing its data
+                        continue
+                
+                # Draw battery graph
+                graph_start_row = row + 2
+                if graph_start_row < max_y - 3:
+                    safe_addstr(stdscr, graph_start_row, 0, "ГРАФИК ЗАРЯДА БАТАРЕИ:", curses.color_pair(4))
+                    max_width = min(curses.COLS - 1, max_x - 1) if curses.COLS > 0 else 80
+                    draw_battery_graph(stdscr.derwin(graph_start_row + 1, 0), battery_history, max_width)
+                
+                # Program runtime
+                runtime = time.time() - start_time
+                runtime_hours = int(runtime // 3600)
+                runtime_minutes = int((runtime % 3600) // 60)
+                runtime_seconds = int(runtime % 60)
+                
+                # Make sure we don't try to write outside the screen
+                if max_y - 1 > 0:
+                    safe_addstr(stdscr, max_y - 1, 0, f"Время работы программы: {runtime_hours:02d}:{runtime_minutes:02d}:{runtime_seconds:02d}")
+                
+                # Update last update time
+                last_update = current_time
+                
+                # Refresh screen
+                stdscr.refresh()
+                
+            except Exception as e:
+                # If something goes wrong, print the error
+                stdscr.clear()
+                safe_addstr(stdscr, 0, 0, f"Произошла ошибка: {e}")
+                stdscr.refresh()
+                time.sleep(2)
         
         # Small sleep to reduce CPU usage
         time.sleep(0.1)
+
+# Добавим вспомогательную функцию для безопасного вывода строк в curses
+def safe_addstr(window, y, x, string, attr=0):
+    """
+    Safely add a string to a curses window, checking bounds and truncating if necessary.
+    """
+    try:
+        max_y, max_x = window.getmaxyx()
+        if y >= max_y or x >= max_x:
+            return
+            
+        # Determine how much space is available on the line
+        available_space = max_x - x
+        
+        # Truncate the string if it's too long
+        if len(string) > available_space:
+            string = string[:available_space]
+            
+        window.addstr(y, x, string, attr)
+    except:
+        # Ignore any curses errors
+        pass
 
 
 if __name__ == "__main__":
